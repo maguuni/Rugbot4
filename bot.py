@@ -50,7 +50,7 @@ def generate_rug_interior(image_bytes: bytes) -> bytes:
     data_url = f"data:image/jpeg;base64,{b64}"
 
     resp = client.responses.create(
-        model="gpt-4.1-mini",
+        model="gpt-4o-mini",
         input=[{
             "role": "user",
             "content": [

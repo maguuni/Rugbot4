@@ -2,14 +2,12 @@ import os
 import io
 import base64
 import asyncio
-import tempfile
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import CommandStart
 
-from PIL import Image
 from openai import OpenAI
 
 load_dotenv()
@@ -24,86 +22,90 @@ if not OPENAI_API_KEY:
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-def prepare_image_for_openai(image_bytes: bytes) -> bytes:
-    """
-    Сжимаем/уменьшаем фото, чтобы:
-    - быстрее работало
-    - не грузило Render
-    """
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    max_side = 1600
-    w, h = img.size
-    scale = max(w, h) / max_side
-    if scale > 1:
-        img = img.resize((int(w / scale), int(h / scale)), Image.LANCZOS)
-
-    out = io.BytesIO()
-    img.save(out, format="JPEG", quality=90, optimize=True)
-    return out.getvalue()
-
-
-def openai_make_interior(image_bytes: bytes) -> bytes:
-    """
-    Отправляем фото ковра в OpenAI как image edit и получаем готовую картинку в интерьере.
-    Используем Images Edit endpoint.  [oai_citation:1‡platform.openai.com](https://platform.openai.com/docs/api-reference/images)
-    """
-    prompt = (
-        "Сделай коммерческое фото для карточки Wildberries: "
-        "аккуратно вырежи ковёр с исходного фото и помести его в фотореалистичный интерьер "
-        "современной квартиры. Интерьер подбирай по оттенкам ковра (гармония цветов), "
-        "сохрани рисунок и фактуру ковра без искажений. "
-        "Перспектива ковра должна совпадать с полом, добавь реалистичные тени от ковра. "
-        "Никаких водяных знаков, текста и логотипов. Высокое качество, как студийная съемка."
+def _build_prompt() -> str:
+    # Жёсткий продающий промпт под WB (можешь потом шлифовать)
+    return (
+        "You are creating a photorealistic marketplace lifestyle image for a rug.\n"
+        "Task:\n"
+        "1) Keep the rug design/pattern/colors from the input photo.\n"
+        "2) Place the SAME rug into a beautiful modern interior that matches the rug tones.\n"
+        "3) The rug must look naturally integrated: correct perspective, scale, soft realistic shadows.\n"
+        "4) Clean, premium staging, no extra text, no logos, no watermarks.\n"
+        "Output: one high-quality photorealistic image."
     )
 
-    # Надёжнее всего для OpenAI клиента — отдать файл с диска (/tmp на Render writable)
-    with tempfile.NamedTemporaryFile(suffix=".jpg") as f:
-        f.write(image_bytes)
-        f.flush()
 
-        result = client.images.edit(
-            model="gpt-image-1.5",
-            image=[open(f.name, "rb")],
-            prompt=prompt,
-            size="1024x1024",
-        )
+def generate_rug_interior(image_bytes: bytes) -> bytes:
+    """
+    Sends image to OpenAI Responses API with image_generation tool.
+    Returns PNG bytes.
+    Docs: Images & vision guide.   [oai_citation:1‡platform.openai.com](https://platform.openai.com/docs/guides/images)
+    """
+    # Telegram обычно присылает JPEG/WEBP. Делаем универсально data-url:
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{b64}"
 
-    b64 = result.data[0].b64_json
-    return base64.b64decode(b64)
+    resp = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": _build_prompt()},
+                {"type": "input_image", "image_url": data_url},
+            ],
+        }],
+        tools=[{"type": "image_generation"}],
+    )
+
+    # В ответе ищем результат генерации (base64 png)
+    image_b64_list = [
+        out.result for out in resp.output
+        if getattr(out, "type", None) == "image_generation_call"
+    ]
+    if not image_b64_list:
+        raise RuntimeError("No image_generation_call in response")
+
+    png_bytes = base64.b64decode(image_b64_list[0])
+    return png_bytes
 
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     await message.answer(
-        "Привет! Пришли фото ковра — я сделаю сразу готовую картинку ковра в подходящем интерьере.\n"
-        "Важно: фото должно быть нормального качества (ковёр виден целиком)."
+        "Привет! Пришли фото ковра — сделаю картинку ковра в подходящем интерьере и пришлю обратно."
     )
 
 
 @dp.message(F.photo)
 async def photo_handler(message: Message):
-    await message.answer("Принял фото. Делаю интерьер…")
+    await message.answer("Принял фото. Делаю интерьер… ⏳")
 
     try:
         photo = message.photo[-1]
-        file_bytes = await bot.download(photo.file_id)
-        raw = file_bytes.read()
+        file = await bot.get_file(photo.file_id)
+        downloaded = await bot.download_file(file.file_path)
+        image_bytes = downloaded.read()
 
-        prepared = await asyncio.to_thread(prepare_image_for_openai, raw)
-        final_img = await asyncio.to_thread(openai_make_interior, prepared)
+        # Генерация может быть долгой — уводим в отдельный поток
+        out_png = await asyncio.to_thread(generate_rug_interior, image_bytes)
 
-        tg_file = BufferedInputFile(final_img, filename="rug_interior.png")
-        await message.answer_photo(
-            photo=tg_file,
-            caption="Готово ✅ Ковёр в интерьере."
+        input_file = BufferedInputFile(out_png, filename="rug_interior.png")
+        await message.answer_document(
+            document=input_file,
+            caption="Готово ✅ Ковёр в подходящем интерьере."
         )
 
     except Exception as e:
         await message.answer(f"Ошибка: {type(e).__name__}: {e}")
+
+
+@dp.message()
+async def other_handler(message: Message):
+    await message.answer("Пришли именно ФОТО ковра 🙂")
 
 
 async def main():
